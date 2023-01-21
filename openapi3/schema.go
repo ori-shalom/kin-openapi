@@ -810,7 +810,7 @@ func (schema *Schema) IsEmpty() bool {
 	if ap := schema.AdditionalProperties.Schema; ap != nil && !ap.Value.IsEmpty() {
 		return false
 	}
-	if apa := schema.AdditionalProperties.Has; apa != nil && *apa {
+	if apa := schema.AdditionalProperties.Has; apa != nil && !*apa {
 		return false
 	}
 	if items := schema.Items; items != nil && !items.Value.IsEmpty() {
@@ -1121,11 +1121,12 @@ func (schema *Schema) visitSetOperations(settings *schemaValidationSettings, val
 		if settings.failfast {
 			return errSchema
 		}
+		allowedValues, _ := json.Marshal(enum)
 		return &SchemaError{
 			Value:                 value,
 			Schema:                schema,
 			SchemaField:           "enum",
-			Reason:                fmt.Sprintf("value is not one of the allowed values %q", schema.Enum),
+			Reason:                fmt.Sprintf("value is not one of the allowed values %s", string(allowedValues)),
 			customizeMessageError: settings.customizeMessageError,
 		}
 	}
@@ -1184,10 +1185,10 @@ func (schema *Schema) visitSetOperations(settings *schemaValidationSettings, val
 		}
 
 		var (
-			ok               = 0
-			validationErrors = multiErrorForOneOf{}
-			matchedOneOfIdx  = 0
-			tempValue        = value
+			ok                  = 0
+			validationErrors    = multiErrorForOneOf{}
+			matchedOneOfIndices = make([]int, 0)
+			tempValue           = value
 		)
 		for idx, item := range v {
 			v := item.Value
@@ -1209,14 +1210,12 @@ func (schema *Schema) visitSetOperations(settings *schemaValidationSettings, val
 				continue
 			}
 
-			matchedOneOfIdx = idx
+			matchedOneOfIndices = append(matchedOneOfIndices, idx)
+			//matchedOneOfIdx = idx
 			ok++
 		}
 
 		if ok != 1 {
-			if len(validationErrors) > 1 {
-				return fmt.Errorf("doesn't match schema due to: %w", validationErrors)
-			}
 			if settings.failfast {
 				return errSchema
 			}
@@ -1228,15 +1227,19 @@ func (schema *Schema) visitSetOperations(settings *schemaValidationSettings, val
 			}
 			if ok > 1 {
 				e.Origin = ErrOneOfConflict
-			} else if len(validationErrors) == 1 {
-				e.Origin = validationErrors[0]
+				e.Reason = fmt.Sprintf(`value matches more than one schema from "oneOf" (matches schemas at indices %v)`, matchedOneOfIndices)
+			} else {
+				e.Origin = fmt.Errorf("doesn't match schema due to: %w", validationErrors)
+				e.Reason = `"value doesn't match any schema from "oneOf"`
 			}
 
 			return e
 		}
 
+		// run again to inject default value that defined in matched oneOf schema
 		if settings.asreq || settings.asrep {
-			_ = v[matchedOneOfIdx].Value.visitJSON(settings, value)
+			//_ = v[matchedOneOfIdx].Value.visitJSON(settings, value)
+			_ = v[matchedOneOfIndices[0]].Value.visitJSON(settings, value)
 		}
 	}
 
@@ -1269,6 +1272,7 @@ func (schema *Schema) visitSetOperations(settings *schemaValidationSettings, val
 				Value:                 value,
 				Schema:                schema,
 				SchemaField:           "anyOf",
+				Reason:                `doesn't match any schema from "anyOf"`,
 				customizeMessageError: settings.customizeMessageError,
 			}
 		}
@@ -1289,6 +1293,7 @@ func (schema *Schema) visitSetOperations(settings *schemaValidationSettings, val
 				Value:                 value,
 				Schema:                schema,
 				SchemaField:           "allOf",
+				Reason:                `doesn't match all schemas from "allOf"`,
 				Origin:                err,
 				customizeMessageError: settings.customizeMessageError,
 			}
@@ -1324,7 +1329,7 @@ func (schema *Schema) VisitJSONBoolean(value bool) error {
 
 func (schema *Schema) visitJSONBoolean(settings *schemaValidationSettings, value bool) (err error) {
 	if schemaType := schema.Type; schemaType != "" && schemaType != TypeBoolean {
-		return schema.expectedType(settings, TypeBoolean)
+		return schema.expectedType(settings, value)
 	}
 	return
 }
@@ -1355,7 +1360,7 @@ func (schema *Schema) visitJSONNumber(settings *schemaValidationSettings, value 
 			me = append(me, err)
 		}
 	} else if schemaType != "" && schemaType != TypeNumber {
-		return schema.expectedType(settings, "number, integer")
+		return schema.expectedType(settings, value)
 	}
 
 	// formats
@@ -1476,6 +1481,7 @@ func (schema *Schema) visitJSONNumber(settings *schemaValidationSettings, value 
 				Value:                 value,
 				Schema:                schema,
 				SchemaField:           "multipleOf",
+				Reason:                fmt.Sprintf("number must be a multiple of %g", *v),
 				customizeMessageError: settings.customizeMessageError,
 			}
 			if !settings.multiError {
@@ -1499,7 +1505,7 @@ func (schema *Schema) VisitJSONString(value string) error {
 
 func (schema *Schema) visitJSONString(settings *schemaValidationSettings, value string) error {
 	if schemaType := schema.Type; schemaType != "" && schemaType != TypeString {
-		return schema.expectedType(settings, TypeString)
+		return schema.expectedType(settings, value)
 	}
 
 	var me MultiError
@@ -1587,6 +1593,12 @@ func (schema *Schema) visitJSONString(settings *schemaValidationSettings, value 
 				}
 			case f.regexp == nil && f.callback != nil:
 				if err := f.callback(value); err != nil {
+					var schemaErr = &SchemaError{}
+					if errors.As(err, &schemaErr) {
+						formatStrErr = fmt.Sprintf(`string doesn't match the format %q (%s)`, format, schemaErr.Reason)
+					} else {
+						formatStrErr = fmt.Sprintf(`string doesn't match the format %q (%v)`, format, err)
+					}
 					formatErr = err
 				}
 			default:
@@ -1624,7 +1636,7 @@ func (schema *Schema) VisitJSONArray(value []interface{}) error {
 
 func (schema *Schema) visitJSONArray(settings *schemaValidationSettings, value []interface{}) error {
 	if schemaType := schema.Type; schemaType != "" && schemaType != TypeArray {
-		return schema.expectedType(settings, TypeArray)
+		return schema.expectedType(settings, value)
 	}
 
 	var me MultiError
@@ -1723,7 +1735,7 @@ func (schema *Schema) VisitJSONObject(value map[string]interface{}) error {
 
 func (schema *Schema) visitJSONObject(settings *schemaValidationSettings, value map[string]interface{}) error {
 	if schemaType := schema.Type; schemaType != "" && schemaType != TypeObject {
-		return schema.expectedType(settings, TypeObject)
+		return schema.expectedType(settings, value)
 	}
 
 	var me MultiError
@@ -1902,15 +1914,20 @@ func (schema *Schema) visitJSONObject(settings *schemaValidationSettings, value 
 	return nil
 }
 
-func (schema *Schema) expectedType(settings *schemaValidationSettings, typ string) error {
+func (schema *Schema) expectedType(settings *schemaValidationSettings, value interface{}) error {
 	if settings.failfast {
 		return errSchema
 	}
+
+	a := "a"
+	if strings.Trim(schema.Type[:1], "aeiou") == "" {
+		a = "an"
+	}
 	return &SchemaError{
-		Value:                 typ,
+		Value:                 value,
 		Schema:                schema,
 		SchemaField:           "type",
-		Reason:                fmt.Sprintf("field must be set to %s or not be present", schema.Type),
+		Reason:                fmt.Sprintf("value must be %s %s", a, schema.Type),
 		customizeMessageError: settings.customizeMessageError,
 	}
 }
@@ -1920,21 +1937,29 @@ func (schema *Schema) compilePattern() (err error) {
 		return &SchemaError{
 			Schema:      schema,
 			SchemaField: "pattern",
+			Origin:      err,
 			Reason:      fmt.Sprintf("cannot compile pattern %q: %v", schema.Pattern, err),
 		}
 	}
 	return nil
 }
 
+// SchemaError is an error that occurs during schema validation.
 type SchemaError struct {
-	Value       interface{}
+	// Value is the value that failed validation.
+	Value interface{}
+	// reversePath is the path to the value that failed validation.
 	reversePath []string
-	Schema      *Schema
+	// Schema is the schema that failed validation.
+	Schema *Schema
+	// SchemaField is the field of the schema that failed validation.
 	SchemaField string
 	// Reason is a human-readable message describing the error.
 	// The message should never include the original value to prevent leakage of potentially sensitive inputs in error messages.
-	Reason                string
-	Origin                error
+	Reason string
+	// Origin is the original error that caused this error.
+	Origin error
+	// customizeMessageError is a function that can be used to customize the error message.
 	customizeMessageError func(err *SchemaError) string
 }
 
